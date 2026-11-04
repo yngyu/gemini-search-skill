@@ -19,7 +19,7 @@ const YOUTUBE_API_HOST = "generativelanguage.googleapis.com";
 const CACHE_DIR = process.env.GEMINI_SEARCH_CACHE_DIR ?? join(homedir(), ".cache", "gemini-search-skill");
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 120_000;
-const REDIRECT_TIMEOUT_MS = 10_000;
+const REDIRECT_TIMEOUT_MS = 3_000;
 const RAW_TIMEOUT_MS = 30_000;
 const RAW_MAX_BYTES = 5 * 1024 * 1024;
 const RAW_TEXT_TYPES = /^(text\/|application\/(json|xml|xhtml\+xml|javascript|ld\+json|rss\+xml|atom\+xml))/;
@@ -30,19 +30,32 @@ const DEFAULT_MAX_CHARS = 8000;
 const RETRY_STATUSES = new Set([429, 500, 502, 503, 504]);
 const RECENCY_LABELS = { day: "the past 24 hours", week: "the past week", month: "the past month", year: "the past year" };
 const YOUTUBE_REGEX = /^(?:https?:\/\/)?(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?v=|shorts\/|live\/|embed\/)|youtu\.be\/)[\w-]{11}/;
+const DEPTHS = ["quick", "normal", "deep"];
+const DEPTH_PRESETS = {
+	quick: { thinking: "low", guidance: "Be concise: answer in a few sentences. Run at most 2 searches, and stop as soon as you have a reliable answer." },
+	normal: { thinking: "medium", guidance: "Be concise but complete. Prefer a small number of well-targeted searches." },
+	deep: {
+		thinking: "high",
+		guidance: "Research thoroughly. Search from several angles, prefer primary sources (official docs, source code, issue trackers, changelogs), cross-check sources against each other, and state your confidence and any disagreement between sources.",
+	},
+};
 const GROUNDING_REDIRECT = "vertexaisearch.cloud.google.com/grounding-api-redirect/";
 
 const USAGE = `Usage:
   gsearch.mjs search "<query>" ["<query>" ...] [--url <url>]... [--recency day|week|month|year]
                      [--domain <domain>]... [--exclude <domain>]...
+                     [--depth quick|normal|deep] [--no-escalate] [--timing]
                      [--evidence] [--raw] [--model <id>] [--max-chars <n>] [--json]
   gsearch.mjs read <url> [<url> ...] [--prompt "<question>"] [--raw] [--model <id>] [--max-chars <n>] [--json]
   gsearch.mjs get <id> [--offset <n>] [--limit <n>] [--find "<text>"]
 
+--depth: quick = fastest (facts, weather), normal = default, deep = thorough (debugging, comparisons).
+         A search that is not grounded or has no sources is retried one level deeper unless --no-escalate.
 --max-chars / --limit 0 means no limit (default ${DEFAULT_MAX_CHARS}).
 Environment: GEMINI_SEARCH_API_KEY, or GEMINI_API_KEY as a fallback (not needed for read --raw)
              GEMINI_BASE_URL (default ${DEFAULT_API_BASE})
-             GEMINI_SEARCH_MODEL (default ${DEFAULT_MODEL})`;
+             GEMINI_SEARCH_MODEL (default ${DEFAULT_MODEL}); GEMINI_SEARCH_MODEL_QUICK overrides it for --depth quick
+             GEMINI_SEARCH_DEPTH (default normal)`;
 
 class UsageError extends Error {}
 
@@ -66,8 +79,20 @@ function getApiBase() {
 	}
 }
 
-function resolveModel(flag) {
-	return flag?.trim() || process.env.GEMINI_SEARCH_MODEL?.trim() || DEFAULT_MODEL;
+function resolveModel(flag, depth = "normal") {
+	const quick = depth === "quick" ? process.env.GEMINI_SEARCH_MODEL_QUICK?.trim() : "";
+	return flag?.trim() || quick || process.env.GEMINI_SEARCH_MODEL?.trim() || DEFAULT_MODEL;
+}
+
+function resolveDepth(flag) {
+	const depth = (flag ?? process.env.GEMINI_SEARCH_DEPTH ?? "normal").trim().toLowerCase();
+	if (!DEPTHS.includes(depth)) throw new UsageError(`--depth must be one of: ${DEPTHS.join(", ")}`);
+	return depth;
+}
+
+let timingEnabled = false;
+function logTiming(label, startedAt) {
+	if (timingEnabled) process.stderr.write(`[timing] ${label}: ${((Date.now() - startedAt) / 1000).toFixed(1)}s\n`);
 }
 
 function parsePositiveInt(value, name, fallback) {
@@ -291,12 +316,13 @@ async function fetchRaw(url) {
 
 // --- Prompts ---
 
-function buildSearchPrompt(query, { urls, recency, domains, excludes }) {
+function buildSearchPrompt(query, { urls, recency, domains, excludes, depth }) {
 	const lines = [
 		`Today is ${today()}.`,
 		"Use Google Search to answer the question below. Be factual and specific: include concrete facts, numbers, dates, and versions.",
 		"If sources disagree or the information cannot be found, say so explicitly instead of guessing. Answer in the same language as the question.",
 	];
+	lines.push(DEPTH_PRESETS[depth].guidance);
 	if (recency) lines.push(`Only use information published within ${RECENCY_LABELS[recency]}.`);
 	if (domains.length) lines.push(`Only use sources from these domains (use site: in your searches): ${domains.join(", ")}.`);
 	if (excludes.length) lines.push(`Do not use sources from these domains: ${excludes.join(", ")}.`);
@@ -374,10 +400,27 @@ function truncateForDisplay(document, id, maxChars) {
 // --- Commands ---
 
 async function searchOne(query, opts) {
+	let depth = opts.depth;
+	for (;;) {
+		const started = Date.now();
+		const outcome = await searchAt(query, { ...opts, depth, model: resolveModel(opts.modelFlag, depth) });
+		logTiming(`search "${query.slice(0, 40)}" depth=${depth}`, started);
+		const unsupported = !outcome.grounded || outcome.sources.length === 0;
+		const next = DEPTHS[DEPTHS.indexOf(depth) + 1];
+		if (!unsupported || !opts.escalate || !next) return outcome;
+		process.stderr.write(`note: "${query.slice(0, 40)}" had no grounded sources at depth ${depth}; retrying at depth ${next}\n`);
+		depth = next;
+	}
+}
+
+async function searchAt(query, opts) {
 	const prompt = buildSearchPrompt(query, opts);
 	const tools = [{ google_search: {} }, ...(opts.urls.length ? [{ url_context: {} }] : [])];
-	const response = await callGemini(opts.model, { contents: [{ role: "user", parts: [{ text: prompt }] }], tools });
+	const body = { contents: [{ role: "user", parts: [{ text: prompt }] }], tools, generationConfig: { thinkingConfig: { thinkingLevel: DEPTH_PRESETS[opts.depth].thinking } } };
+	const response = await callGemini(opts.model, body);
+	const parseStarted = Date.now();
 	const result = await parseResponse(response);
+	logTiming("parse + redirects", parseStarted);
 
 	const grounded = result.searchQueries.length > 0 || result.sources.length > 0;
 	result.warnings = [];
@@ -411,10 +454,14 @@ async function commandSearch(argv) {
 			evidence: { type: "boolean", default: false },
 			raw: { type: "boolean", default: false },
 			model: { type: "string" },
+			depth: { type: "string" },
+			"no-escalate": { type: "boolean", default: false },
+			timing: { type: "boolean", default: false },
 			"max-chars": { type: "string" },
 			json: { type: "boolean", default: false },
 		},
 	});
+	timingEnabled = values.timing;
 	const queries = positionals.map((q) => q.trim()).filter(Boolean);
 	if (!queries.length) throw new UsageError("search needs at least one query.");
 	if (queries.length > MAX_QUERIES) throw new UsageError(`At most ${MAX_QUERIES} queries per call.`);
@@ -428,7 +475,9 @@ async function commandSearch(argv) {
 		excludes: values.exclude.map((d) => d.trim()).filter(Boolean),
 		evidence: values.evidence,
 		raw: values.raw,
-		model: resolveModel(values.model),
+		modelFlag: values.model,
+		depth: resolveDepth(values.depth),
+		escalate: !values["no-escalate"],
 	};
 	const maxChars = parsePositiveInt(values["max-chars"], "max-chars", DEFAULT_MAX_CHARS);
 

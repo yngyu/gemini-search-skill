@@ -7,97 +7,40 @@ compatibility: "Requires Node.js 20.12+, outbound network access, and GEMINI_SEA
 
 # Gemini Web Search
 
-`scripts/gsearch.mjs` sits in the same directory as this SKILL.md. In the examples below, `gsearch` means:
+`gsearch` = `node <directory containing this SKILL.md>/scripts/gsearch.mjs` (use the absolute path). Run `gsearch --help` for all options.
 
-```bash
-node <directory containing this SKILL.md>/scripts/gsearch.mjs
-```
-
-Use the absolute path; the script works from any working directory.
-
-## When to use
-
-When you don't know something, aren't sure your knowledge is current, or think a web search would help, search instead of guessing. Typical cases: recent versions, release notes, prices, news, API details, or the content of a specific URL.
+Search instead of guessing when you are unsure or your knowledge may be outdated: versions, release notes, prices, news, API details, errors, or a specific URL.
 
 ## Commands
 
-### search: answer a question from the web
-
-Gemini runs the Google searches, reads the results, and writes an answer with `[n]` citations.
-
 ```bash
-gsearch search "latest stable Node.js version"
-gsearch search "query one" "query two"             # up to 5 queries in parallel
-gsearch search "Bun release notes" --recency month
-gsearch search "useEffect cleanup timing" --domain react.dev
-gsearch search "compare pricing" --url https://a.example/pricing --url https://b.example/pricing
-gsearch search "..." --evidence                    # list which answer sentence is backed by which source
-gsearch search "..." --raw                         # links only: Gemini's searches and sources, no answer
+gsearch search "query" ["query2" ...]   # up to 5 queries, run in parallel; cited answer
+gsearch read <url> --prompt "question"  # Gemini reads a page, PDF, or YouTube video
+gsearch read <url> --raw                # exact page text, no Gemini (text/HTML only)
+gsearch get <id> [--offset n | --find "text"]   # page through a stored result (kept 24h)
 ```
 
-| Option | Meaning |
-|---|---|
-| `--recency day\|week\|month\|year` | Only use recent information |
-| `--domain example.com` | Only use this domain (repeatable) |
-| `--exclude example.com` | Do not use this domain (repeatable) |
-| `--url <url>` | Also read this URL (repeatable, up to 20) |
-| `--evidence` | List each cited sentence with its source numbers |
-| `--raw` | Return only the search queries and source links, so you can read and judge the sources yourself |
+`search` options: `--depth quick|normal|deep`, `--recency day|week|month|year`, `--domain d` / `--exclude d` (repeatable), `--url u` (also read this URL), `--evidence` (sentence → source map), `--raw` (links only, no answer).
+Output is capped at 8000 chars; use `--max-chars n` (0 = unlimited) or `get`. `--json` gives structured output.
 
-### read: read specific URLs
+## Choose `--depth` per question
 
-```bash
-gsearch read https://example.com/docs/install --prompt "What are the installation steps?"
-gsearch read https://example.com/report.pdf --prompt "List the key figures"
-gsearch read https://www.youtube.com/watch?v=VIDEO_ID --prompt "Summarize with timestamps"
-gsearch read https://example.com/docs/install --raw   # exact page text, no Gemini
-```
+- `quick`: one cheap-to-get-wrong fact (weather, exchange rate, latest version). ~7s.
+- `normal` (default): general lookups. ~18s.
+- `deep`: debugging, error investigation, version-dependent behavior, breaking changes, comparisons, conflicting sources. ~30s+. Pass several queries from different angles (error text, official docs, GitHub issues).
 
-- Without `--raw`, Gemini reads the page (web pages, PDFs, and YouTube videos) and writes a report or answers `--prompt`. This is a rewrite, not the original text.
-- With `--raw`, the script downloads the page itself and returns its text. Use it when you need the exact wording, code, or numbers. Text and HTML only; no PDFs or videos. No API key needed.
+No-source results are retried one level deeper automatically (`--no-escalate` disables). Keep queries short; use `--recency` only when freshness matters.
 
-### get: page through a stored result
+## Reading output
 
-Every result ends with an `id` and is kept for 24 hours.
+- `[n]` in the answer maps to `[n]` in Sources; cite those URLs.
+- `grounded: NO` means no search happened; the answer is from memory and may be outdated.
+- `WARNING:` lines flag unreliable parts. For important claims, verify with `--evidence` or `read --raw` on the source.
 
-```bash
-gsearch get 1a2b3c4d                     # full stored result (includes the evidence section for search)
-gsearch get 1a2b3c4d --offset 8000       # continue a truncated result
-gsearch get 1a2b3c4d --find "pricing"    # lines containing a word
-```
+## Errors
 
-### Output length
-
-`search` and `read` print at most 8000 characters by default; `get` returns 8000 characters per call. Choose the size that fits your context:
-
-- `--max-chars <n>` on `search` / `read`, `--limit <n>` on `get`
-- `0` means no limit
-- Truncated output ends with the exact `get` command to continue.
-
-`--json` on `search` / `read` prints the full structured result instead.
-
-## Reading the output
-
-```
-# Web search: <query>
-model: gemini-3.8-flash · grounded: yes · searches: <what Gemini searched>
-
-<answer with citation markers like [1][3]>
-
-## Sources
-[1] title — https://...
-[2] title — https://... (not cited)
-```
-
-- `[n]` in the answer refers to `[n]` in Sources. Cite these URLs when you use the information.
-- `grounded: NO` means Gemini did not search; the answer is from its own memory and may be outdated.
-- `WARNING:` lines flag unreliable parts: unretrievable URLs, sources outside `--domain`, or a truncated answer.
-- Gemini can add details that are not in its sources. For important claims, check with `--evidence` or `read --raw` on the cited URL.
-
-## Setup and errors
-
-- The API key comes from `GEMINI_SEARCH_API_KEY`, or `GEMINI_API_KEY` when that is not set (environment or this skill's `.env`). If neither is set, ask the user to set one; see README.md.
-- YouTube URLs only work with the default Gemini API endpoint. When the user has set `GEMINI_BASE_URL` to another endpoint (such as Vertex AI), YouTube URLs are skipped with a `WARNING:` line.
-- `Gemini API error 401`, `402`, or `403`: a key, billing, or API access problem on the user's Google project. Tell the user; do not retry.
-- `Gemini API error 429`: rate limit or quota. The script already retried; wait and try once more, or tell the user.
-- `Gemini API error 400/404` about the model: set `GEMINI_SEARCH_MODEL` or pass `--model` with a valid model ID.
+- No API key: ask the user to set `GEMINI_SEARCH_API_KEY` (see README.md).
+- `401/402/403`: key, billing, or access problem; tell the user, do not retry.
+- `429`: already retried; wait and retry once, or tell the user.
+- `400/404` about the model: set `GEMINI_SEARCH_MODEL` or pass `--model`.
+- YouTube works only with the default endpoint (skipped with a `WARNING:` otherwise).
