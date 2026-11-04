@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Web search and URL reading through Gemini on Vertex AI (Grounding with Google Search + URL context).
-// Zero dependencies; requires Node.js 20.12+ and a Google Cloud API key in GEMINI_SEARCH_API_KEY.
+// Web search and URL reading through Gemini (Grounding with Google Search + URL context).
+// Zero dependencies; requires Node.js 20.12+ and GEMINI_SEARCH_API_KEY (or GEMINI_API_KEY as a fallback).
 // Variables can also be set in the skill's optional .env file; the process environment wins.
 
 import { parseArgs } from "node:util";
@@ -14,7 +14,8 @@ const ENV_FILE = fileURLToPath(new URL("../.env", import.meta.url));
 if (existsSync(ENV_FILE)) process.loadEnvFile(ENV_FILE);
 
 const DEFAULT_MODEL = "gemini-3.8-flash";
-const API_BASE = "https://aiplatform.googleapis.com/v1/publishers/google";
+const DEFAULT_API_BASE = "https://generativelanguage.googleapis.com/v1beta";
+const YOUTUBE_API_HOST = "generativelanguage.googleapis.com";
 const CACHE_DIR = process.env.GEMINI_SEARCH_CACHE_DIR ?? join(homedir(), ".cache", "gemini-search-skill");
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 120_000;
@@ -39,7 +40,8 @@ const USAGE = `Usage:
   gsearch.mjs get <id> [--offset <n>] [--limit <n>] [--find "<text>"]
 
 --max-chars / --limit 0 means no limit (default ${DEFAULT_MAX_CHARS}).
-Environment: GEMINI_SEARCH_API_KEY (Google Cloud API key for Vertex AI; not needed for read --raw),
+Environment: GEMINI_SEARCH_API_KEY, or GEMINI_API_KEY as a fallback (not needed for read --raw)
+             GEMINI_BASE_URL (default ${DEFAULT_API_BASE})
              GEMINI_SEARCH_MODEL (default ${DEFAULT_MODEL})`;
 
 class UsageError extends Error {}
@@ -50,9 +52,18 @@ function today() {
 }
 
 function getApiKey() {
-	const key = process.env.GEMINI_SEARCH_API_KEY?.trim();
-	if (!key) throw new UsageError("GEMINI_SEARCH_API_KEY is not set.");
+	const key = process.env.GEMINI_SEARCH_API_KEY?.trim() || process.env.GEMINI_API_KEY?.trim();
+	if (!key) throw new UsageError("Neither GEMINI_SEARCH_API_KEY nor GEMINI_API_KEY is set.");
 	return key;
+}
+
+function getApiBase() {
+	const base = (process.env.GEMINI_BASE_URL?.trim() || DEFAULT_API_BASE).replace(/\/+$/, "");
+	try {
+		return { base, host: new URL(base).hostname };
+	} catch {
+		throw new UsageError(`Invalid GEMINI_BASE_URL: ${base}`);
+	}
 }
 
 function resolveModel(flag) {
@@ -83,7 +94,8 @@ function validateUrls(urls) {
 
 async function callGemini(model, body) {
 	const apiKey = getApiKey();
-	const url = `${API_BASE}/models/${encodeURIComponent(model)}:generateContent`;
+	const { base, host } = getApiBase();
+	const url = `${base}/models/${encodeURIComponent(model)}:generateContent`;
 	for (let attempt = 0; ; attempt++) {
 		const res = await fetch(url, {
 			method: "POST",
@@ -100,7 +112,7 @@ async function callGemini(model, body) {
 			await new Promise((resolve) => setTimeout(resolve, delayMs));
 			continue;
 		}
-		throw new Error(`Gemini API error ${res.status} (model ${model}): ${text.slice(0, 500)}`);
+		throw new Error(`Gemini API error ${res.status} (${host}, model ${model}): ${text.slice(0, 500)}`);
 	}
 }
 
@@ -456,18 +468,25 @@ async function commandRead(argv) {
 	const question = values.prompt?.trim()
 		|| "Report the main content of each URL in detail. Preserve facts, numbers, dates, code, and tables. Do not add information that is not on the page.";
 
-	if (positionals.some((u) => YOUTUBE_REGEX.test(u))) {
-		throw new UsageError("YouTube URLs are not supported: Vertex AI rejects them when called with an API key.");
+	const pages = positionals.filter((u) => !YOUTUBE_REGEX.test(u));
+	let videos = positionals.filter((u) => YOUTUBE_REGEX.test(u));
+	const warnings = [];
+	if (videos.length && getApiBase().host !== YOUTUBE_API_HOST) {
+		warnings.push(`Ignored ${videos.length} YouTube URL(s): YouTube is only supported with the default ${YOUTUBE_API_HOST} endpoint.`);
+		videos = [];
 	}
-	const text = [`Today is ${today()}.`, question, "", "URLs:", ...positionals].join("\n");
-	const body = { contents: [{ role: "user", parts: [{ text }] }], tools: [{ url_context: {} }] };
+	if (!pages.length && !videos.length) throw new UsageError(`No URLs to read: YouTube URLs are ignored unless GEMINI_BASE_URL points to ${YOUTUBE_API_HOST}.`);
+
+	const text = [`Today is ${today()}.`, question, ...(pages.length ? ["", "URLs:", ...pages] : [])].join("\n");
+	const parts = [...videos.map((fileUri) => ({ fileData: { fileUri } })), { text }];
+	const body = { contents: [{ role: "user", parts }], ...(pages.length ? { tools: [{ url_context: {} }] } : {}) };
 
 	const response = await callGemini(model, body);
 	const result = await parseResponse(response);
-	result.warnings = [];
+	result.warnings = warnings;
 	const failed = result.urlStatus.filter((u) => u.status !== "SUCCESS");
 	if (failed.length) result.warnings.push(`${failed.length} URL(s) could not be retrieved; content for them may be missing or guessed.`);
-	if (!result.urlStatus.length) result.warnings.push("Gemini reported no URL retrieval; the answer may not be based on the page content.");
+	if (pages.length && !result.urlStatus.length) result.warnings.push("Gemini reported no URL retrieval; the answer may not be based on the page content.");
 
 	const document = renderDocument(`Read: ${positionals.join(", ")}`, model, result, { showEvidence: false });
 	const id = saveRecord({ command: "read", urls: positionals, model, result, document, response });

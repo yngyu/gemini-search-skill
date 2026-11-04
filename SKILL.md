@@ -1,7 +1,8 @@
 ---
 name: gemini-search-skill
-description: "Searches the web and reads web pages and PDFs through Gemini on Vertex AI (Google Search grounding and URL context), returning cited answers, source links, or raw page text. Use when you do not know something, need current or verifiable information, or think a web search would help."
-compatibility: "Requires Node.js 20.12+, outbound network access, and a Google Cloud API key for Vertex AI in GEMINI_SEARCH_API_KEY."
+license: MIT
+description: "Searches the web and reads web pages, PDFs, and YouTube videos through Gemini (Google Search grounding and URL context), returning cited answers, source links, or raw page text. Use when you do not know something, need current or verifiable information, or think a web search would help."
+compatibility: "Requires Node.js 20.12+, outbound network access, and GEMINI_SEARCH_API_KEY or GEMINI_API_KEY."
 ---
 
 # Gemini Web Search
@@ -48,10 +49,11 @@ gsearch search "..." --raw                         # links only: Gemini's search
 ```bash
 gsearch read https://example.com/docs/install --prompt "What are the installation steps?"
 gsearch read https://example.com/report.pdf --prompt "List the key figures"
+gsearch read https://www.youtube.com/watch?v=VIDEO_ID --prompt "Summarize with timestamps"
 gsearch read https://example.com/docs/install --raw   # exact page text, no Gemini
 ```
 
-- Without `--raw`, Gemini reads the page (web pages and PDFs; YouTube is not supported) and writes a report or answers `--prompt`. This is a rewrite, not the original text.
+- Without `--raw`, Gemini reads the page (web pages, PDFs, and YouTube videos) and writes a report or answers `--prompt`. This is a rewrite, not the original text.
 - With `--raw`, the script downloads the page itself and returns its text. Use it when you need the exact wording, code, or numbers. Text and HTML only; no PDFs or videos. No API key needed.
 
 ### get: page through a stored result
@@ -94,7 +96,8 @@ model: gemini-3.8-flash · grounded: yes · searches: <what Gemini searched>
 
 ## Setup and errors
 
-- The script calls Gemini on Vertex AI with the Google Cloud API key in `GEMINI_SEARCH_API_KEY` (environment or this skill's `.env`). If it is not set, ask the user to set it; see README.md.
-- `Gemini API error 401` or `403`: the key is not a Vertex AI key, the Agent Platform API is not enabled, or billing is not set up on the user's Google Cloud project. Tell the user; do not retry.
+- The API key comes from `GEMINI_SEARCH_API_KEY`, or `GEMINI_API_KEY` when that is not set (environment or this skill's `.env`). If neither is set, ask the user to set one; see README.md.
+- YouTube URLs only work with the default Gemini API endpoint. When the user has set `GEMINI_BASE_URL` to another endpoint (such as Vertex AI), YouTube URLs are skipped with a `WARNING:` line.
+- `Gemini API error 401`, `402`, or `403`: a key, billing, or API access problem on the user's Google project. Tell the user; do not retry.
 - `Gemini API error 429`: rate limit or quota. The script already retried; wait and try once more, or tell the user.
 - `Gemini API error 400/404` about the model: set `GEMINI_SEARCH_MODEL` or pass `--model` with a valid model ID.
